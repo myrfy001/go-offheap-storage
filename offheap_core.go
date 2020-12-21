@@ -42,7 +42,7 @@ func divRoundUp(n, a int) int {
 func generateSize2ClassMap() {
 
 	for i := range sizeToClassSmall {
-		size := i*largeSizeDiv
+		size := i*smallSizeDiv
 		for j, c := range classToSize {
 			if int(c) >= size {
 				sizeToClassSmall[i] = j
