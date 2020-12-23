@@ -1,6 +1,9 @@
 package offheapstorage
 
-import "fmt"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 const (
 	smallSizeDiv     = 8
@@ -16,6 +19,7 @@ const (
 	blockInnerAddrBitsMask = 0x7ffff
 	blockIdxBitsMask       = 0xfffff
 	spanSizeClasBitsMask   = 0x7f
+	fullDataBitMask        = 0x8000000000000
 )
 
 var (
@@ -25,8 +29,8 @@ var (
 
 var classToSize = [spanSizeClassCnt]uint16{0, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264, 28672, 32768}
 
-var sizeToClassSmall = [smallSizeMax/smallSizeDiv+1]int{}
-var sizeToClassLarge = [(maxSpanSize-smallSizeMax)/largeSizeDiv+1]int{}
+var sizeToClassSmall = [smallSizeMax/smallSizeDiv + 1]int{}
+var sizeToClassLarge = [(maxSpanSize-smallSizeMax)/largeSizeDiv + 1]int{}
 
 func init() {
 	generateSize2ClassMap()
@@ -42,7 +46,7 @@ func divRoundUp(n, a int) int {
 func generateSize2ClassMap() {
 
 	for i := range sizeToClassSmall {
-		size := i*smallSizeDiv
+		size := i * smallSizeDiv
 		for j, c := range classToSize {
 			if int(c) >= size {
 				sizeToClassSmall[i] = j
@@ -70,11 +74,11 @@ func generateSize2ClassMap() {
 	20 bits for block index in a span size class
 	5  bits for reserve use
 
-	+----------+----------+-----------------+------------------------------+-----------------+
-	|   51     |  50 - 46 |    45 - 39      |           38 - 19            |     18 - 0      |
-	+----------+----------+-----------------+------------------------------+-----------------+
-	| FullData | Reserved | Span Size Class | Block Idx In Span Size Class | Offset In Block |
-	+----------+----------+-----------------+------------------------------+-----------------+
+	+-------------+----------+-----------------+------------------------------+-----------------+
+	|     51      |  50 - 46 |    45 - 39      |           38 - 19            |     18 - 0      |
+	+-------------+----------+-----------------+------------------------------+-----------------+
+	| NotFullData | Reserved | Span Size Class | Block Idx In Span Size Class | Offset In Block |
+	+-------------+----------+-----------------+------------------------------+-----------------+
 */
 
 type OffHeapStorageCore struct {
@@ -125,6 +129,26 @@ func (s *OffHeapStorageCore) Put(data []byte) (uint64, error) {
 	return addr, nil
 }
 
+func (s *OffHeapStorageCore) PutBig(data []byte, nextAddr uint64) (uint64, error) {
+	dataSize := len(data)
+	spanClassIdx := 0
+	if dataSize <= smallSizeMax-8 {
+		spanClassIdx = sizeToClassSmall[divRoundUp(dataSize, smallSizeDiv)]
+	} else if dataSize <= maxSpanSize {
+		spanClassIdx = sizeToClassLarge[divRoundUp(dataSize-smallSizeMax, largeSizeDiv)]
+	} else {
+		return 0, ErrDataTooBig
+	}
+
+	span := s.spans[spanClassIdx]
+
+	addr := span.PutBig(data, nextAddr)
+	addr |= uint64(spanClassIdx << spanSizeClassBitOffset)
+	addr |= fullDataBitMask
+	s.addr2SizeMap[addr] = uint16(dataSize)
+	return addr, nil
+}
+
 func (s *OffHeapStorageCore) Get(addr uint64, buf []byte) (uint16, error) {
 	size, ok := s.addr2SizeMap[addr]
 	if !ok {
@@ -139,6 +163,20 @@ func (s *OffHeapStorageCore) Get(addr uint64, buf []byte) (uint16, error) {
 	return size, span.Get(addr, size, buf)
 }
 
+func (s *OffHeapStorageCore) GetBig(addr uint64) ([]byte, uint64, error) {
+	size, ok := s.addr2SizeMap[addr]
+	if !ok {
+		return nil, 0, ErrAddrNotExist
+	}
+
+	spanClassIdx := (addr >> spanSizeClassBitOffset) & spanSizeClasBitsMask
+	if spanClassIdx >= uint64(len(s.spans)) {
+		return nil, 0, ErrAddrNotExist
+	}
+	span := s.spans[spanClassIdx]
+	return span.GetBig(addr, size)
+}
+
 func (s *OffHeapStorageCore) Delete(addr uint64) error {
 	if _, ok := s.addr2SizeMap[addr]; !ok {
 		return ErrAddrNotExist
@@ -151,6 +189,20 @@ func (s *OffHeapStorageCore) Delete(addr uint64) error {
 	}
 	span := s.spans[spanClassIdx]
 	return span.Delete(addr)
+}
+
+func (s *OffHeapStorageCore) DeleteBig(addr uint64) (uint64, error) {
+	if _, ok := s.addr2SizeMap[addr]; !ok {
+		return 0, ErrAddrNotExist
+	}
+	delete(s.addr2SizeMap, addr)
+
+	spanClassIdx := (addr >> spanSizeClassBitOffset) & spanSizeClasBitsMask
+	if spanClassIdx >= uint64(len(s.spans)) {
+		return 0, ErrAddrNotExist
+	}
+	span := s.spans[spanClassIdx]
+	return span.DeleteBig(addr)
 }
 
 func newMemSpan(cellSize int32) *memSpan {
@@ -176,6 +228,23 @@ func (s *memSpan) Put(data []byte) uint64 {
 	return addr
 }
 
+func (s *memSpan) PutBig(data []byte, nextAddr uint64) uint64 {
+	freeBlockIdx := s.usageMap.GetFirstUnsetBit()
+	if freeBlockIdx == len(s.blocks) {
+		newBlock := newMemBlock(s.cellSize)
+		s.blocks = append(s.blocks, newBlock)
+	}
+	freeBlock := s.blocks[freeBlockIdx]
+	addr := freeBlock.PutBig(data, nextAddr)
+
+	if freeBlock.cellCnt == freeBlock.usedCellCnt {
+		s.usageMap.Set(uint(freeBlockIdx))
+	}
+
+	addr |= uint64(freeBlockIdx << blockIdxBitOffset)
+	return addr
+}
+
 func (s *memSpan) Get(addr uint64, size uint16, buf []byte) error {
 	blockIdx := (addr >> blockIdxBitOffset) & blockIdxBitsMask
 	if blockIdx >= uint64(len(s.blocks)) {
@@ -183,6 +252,16 @@ func (s *memSpan) Get(addr uint64, size uint16, buf []byte) error {
 	}
 	block := s.blocks[blockIdx]
 	return block.Get(addr, size, buf)
+
+}
+
+func (s *memSpan) GetBig(addr uint64, size uint16) ([]byte, uint64, error) {
+	blockIdx := (addr >> blockIdxBitOffset) & blockIdxBitsMask
+	if blockIdx >= uint64(len(s.blocks)) {
+		return nil, 0, ErrAddrNotExist
+	}
+	block := s.blocks[blockIdx]
+	return block.GetBig(addr, size)
 
 }
 
@@ -203,6 +282,24 @@ func (s *memSpan) Delete(addr uint64) error {
 	return nil
 }
 
+func (s *memSpan) DeleteBig(addr uint64) (uint64, error) {
+	blockIdx := (addr >> blockIdxBitOffset) & blockIdxBitsMask
+	if blockIdx >= uint64(len(s.blocks)) {
+		return 0, ErrAddrNotExist
+	}
+	block := s.blocks[blockIdx]
+
+	addr, err := block.DeleteBig(addr)
+	if err != nil {
+		return 0, err
+	}
+
+	if block.cellSize != block.usedCellCnt {
+		s.usageMap.UnSet(uint(blockIdx))
+	}
+	return addr, nil
+}
+
 func newMemBlock(cellSize int32) *memBlock {
 	return &memBlock{
 		cellCnt:  int32(blockSize / cellSize),
@@ -220,6 +317,17 @@ func (b *memBlock) Put(data []byte) uint64 {
 	return uint64(startOffset) >> 3
 }
 
+func (b *memBlock) PutBig(data []byte, nextAddr uint64) uint64 {
+
+	freeCellIdx := b.usageMap.GetFirstUnsetBit()
+	b.usageMap.Set(uint(freeCellIdx))
+	b.usedCellCnt++
+	startOffset := int(freeCellIdx) * int(b.cellSize)
+	binary.LittleEndian.PutUint64(b.buf[startOffset:], nextAddr)
+	copy(b.buf[startOffset+8:], data)
+	return uint64(startOffset) >> 3
+}
+
 func (b *memBlock) Get(addr uint64, size uint16, buf []byte) error {
 	addrInCell := uint64(addr&blockInnerAddrBitsMask) << 3
 	cellIdx := addrInCell / uint64(b.cellSize)
@@ -228,6 +336,16 @@ func (b *memBlock) Get(addr uint64, size uint16, buf []byte) error {
 	}
 	copy(buf, b.buf[addrInCell:(addrInCell+uint64(size))])
 	return nil
+}
+func (b *memBlock) GetBig(addr uint64, size uint16) ([]byte, uint64, error) {
+	addrInCell := uint64(addr&blockInnerAddrBitsMask) << 3
+	cellIdx := addrInCell / uint64(b.cellSize)
+	if cellIdx >= uint64(b.cellCnt) {
+		return nil,0 ,ErrAddrNotExist
+	}
+	addr = binary.LittleEndian.Uint64(b.buf[addrInCell:])
+	addrInCell += 8
+	return b.buf[addrInCell:(addrInCell+uint64(size))], addr, nil
 }
 
 func (b *memBlock) Delete(addr uint64) error {
@@ -238,4 +356,16 @@ func (b *memBlock) Delete(addr uint64) error {
 	b.usageMap.UnSet(uint(cellIdx))
 	b.usedCellCnt--
 	return nil
+}
+
+func (b *memBlock) DeleteBig(addr uint64) (uint64, error) {
+	cellIdx := (uint64(addr&blockInnerAddrBitsMask) << 3) / uint64(b.cellSize)
+	if cellIdx >= uint64(b.cellCnt) {
+		return 0, ErrAddrNotExist
+	}
+	addrInCell := uint64(addr&blockInnerAddrBitsMask) << 3
+	addr = binary.LittleEndian.Uint64(b.buf[addrInCell:])
+	b.usageMap.UnSet(uint(cellIdx))
+	b.usedCellCnt--
+	return addr, nil
 }
